@@ -172,18 +172,20 @@ CHAT_UI_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _agent, _agent_error
     try:
         from agent import SHLAgent
-        _agent = SHLAgent()
+        loop = asyncio.get_running_loop()
+        # Load model in background thread so FastAPI binds to port immediately
+        _agent = await loop.run_in_executor(None, SHLAgent)
         logger.info("Agent ready.")
     except Exception as exc:
         _agent_error = str(exc)
         logger.error("Agent failed to start: %s", exc)
     yield
-
 
 app = FastAPI(title="SHL Assessment Recommender", lifespan=lifespan)
 
@@ -266,3 +268,9 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
     return result
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
