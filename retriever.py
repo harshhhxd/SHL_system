@@ -55,7 +55,7 @@ class CatalogRetriever:
             if _name_matches_patterns(item["name"], ALWAYS_INCLUDE_PATTERNS)
         ]
 
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = SentenceTransformer("paraphrase-MiniLM-L3-v2")
         self._build_index()
 
     def _build_index(self):
