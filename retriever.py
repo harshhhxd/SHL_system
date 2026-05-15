@@ -2,8 +2,8 @@ import json
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Set
-from sentence_transformers import SentenceTransformer
-import faiss
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 ALWAYS_INCLUDE_PATTERNS: List[str] = [
     "OPQ32r",
@@ -15,12 +15,19 @@ ALWAYS_INCLUDE_PATTERNS: List[str] = [
     "Verify Interactive - Verbal",
 ]
 
-# keywords that should trigger pulling ALL matching catalog items by name
 TECH_KEYWORDS = [
     "java", "python", "javascript", "sql", "c++", "c#", ".net",
     "react", "angular", "node", "php", "ruby", "swift", "kotlin",
     "excel", "powerpoint", "word", "sap", "salesforce",
 ]
+
+TECH_VARIANT_GROUPS: dict = {
+    "python":     ["Python (New)", "Python (Advanced Level)"],
+    "java":       ["Core Java (Advanced Level) (New)", "Java 8 (New)"],
+    "javascript": ["JavaScript (Advanced Level) (New)", "JavaScript (New)"],
+    "sql":        ["SQL (New)", "SQL (Advanced Level) (New)"],
+    "c#":         ["C# (New)", "C# (Advanced Level) (New)"],
+}
 
 
 def _name_matches_patterns(name: str, patterns: List[str]) -> bool:
@@ -55,53 +62,61 @@ class CatalogRetriever:
             if _name_matches_patterns(item["name"], ALWAYS_INCLUDE_PATTERNS)
         ]
 
-        self.encoder = SentenceTransformer("paraphrase-MiniLM-L3-v2")
         self._build_index()
 
     def _build_index(self):
         texts = [build_search_text(item) for item in self.catalog]
-        embeddings = self.encoder.encode(
-            texts, show_progress_bar=False
-        ).astype(np.float32)
-        faiss.normalize_L2(embeddings)
-        self.index = faiss.IndexFlatIP(embeddings.shape[1])
-        self.index.add(embeddings)
-        print(f"[retriever] indexed {len(self.catalog)} assessments")
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=1,
+            stop_words="english"
+        )
+        self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        print(f"[retriever] indexed {len(self.catalog)} assessments (TF-IDF)")
 
     def _extract_tech_keywords(self, query: str) -> List[str]:
-        # return tech words found in query that have dedicated catalog tests
         q_lower = query.lower()
         return [kw for kw in TECH_KEYWORDS if kw in q_lower]
 
     def _tech_matches(self, query: str) -> List[Dict]:
-        # pull every catalog item whose name contains the detected tech keyword
         hits = []
         seen = set()
+
         for kw in self._extract_tech_keywords(query):
+            # pin variant groups first
+            if kw in TECH_VARIANT_GROUPS:
+                for variant_name in TECH_VARIANT_GROUPS[kw]:
+                    for item in self.catalog:
+                        if (variant_name.lower() in item["name"].lower()
+                                and item["url"] not in seen):
+                            hits.append(item)
+                            seen.add(item["url"])
+            # then catch everything else with that keyword
             for item in self.catalog:
                 if kw in item["name"].lower() and item["url"] not in seen:
                     hits.append(item)
                     seen.add(item["url"])
+
         return hits
 
     def _keyword_score(self, query: str, item: dict) -> int:
-        # count how many query words (len>=3) appear in item name
         q_words = {w.lower() for w in query.split() if len(w) >= 3}
         name_lower = item["name"].lower()
         return sum(1 for w in q_words if w in name_lower)
 
     def search(self, query: str, top_k: int = 12) -> List[Dict]:
-        # FAISS semantic search with a bigger fetch window
-        fetch_k = min(top_k * 3, len(self.catalog))
-        q = self.encoder.encode([query]).astype(np.float32)
-        faiss.normalize_L2(q)
-        _, indices = self.index.search(q, fetch_k)
-        candidates = [self.catalog[i] for i in indices[0]]
+        # TF-IDF cosine similarity search
+        query_vec = self.vectorizer.transform([query])
+        scores = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
+        top_indices = np.argsort(scores)[::-1][:top_k * 3]
+        candidates = [self.catalog[i] for i in top_indices]
 
-        # score by keyword overlap and sort descending
-        candidates.sort(key=lambda item: self._keyword_score(query, item), reverse=True)
+        # keyword re-rank
+        candidates.sort(
+            key=lambda item: self._keyword_score(query, item), reverse=True
+        )
 
-        # inject tech-specific items at the front, deduplicated
+        # inject tech-specific items at the front
         tech_hits = self._tech_matches(query)
         seen_urls = {item["url"] for item in tech_hits}
         non_tech = [c for c in candidates if c["url"] not in seen_urls]
